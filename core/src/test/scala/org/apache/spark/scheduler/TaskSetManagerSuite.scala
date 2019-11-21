@@ -275,6 +275,33 @@ class TaskSetManagerSuite extends SparkFunSuite with LocalSparkContext with Logg
     assert(manager.resourceOffer("execA", "host1", ANY).get.index === 0)
   }
 
+  test("locality wait should be maintained per executor id") {
+    sc = new SparkContext("local", "test")
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
+    val taskSet = FakeTask.createTaskSet(5,
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host1", "exec1"))
+    )
+    val clock = new ManualClock
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES, clock = clock)
+    // First offer host1, exec1: first task should be chosen
+    assert(manager.resourceOffer("exec2", "host2", NODE_LOCAL).isEmpty)
+
+    clock.advance(LOCALITY_WAIT_MS)
+    assert(manager.resourceOffer("exec1", "host1", NODE_LOCAL).get.index == 0)
+    assert(manager.resourceOffer("exec2", "host2", ANY).isEmpty)
+
+    clock.advance(LOCALITY_WAIT_MS)
+    assert(manager.resourceOffer("exec1", "host1", NODE_LOCAL).get.index == 1)
+    assert(manager.resourceOffer("exec2", "host2", ANY).get.index == 2)
+
+    assert(manager.resourceOffer("exec1", "host1", NODE_LOCAL).get.index == 3)
+    assert(manager.resourceOffer("exec2", "host2", ANY).get.index == 4)
+  }
+
   test("basic delay scheduling") {
     sc = new SparkContext("local", "test")
     sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
