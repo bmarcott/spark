@@ -195,6 +195,72 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
     assert(!failedTaskSet)
   }
 
+  test("executors should not sit idle for too long") {
+    val LOCALITY_WAIT_MS = 3000
+    val clock = new ManualClock
+    val conf = new SparkConf()
+    sc = new SparkContext("local", "TaskSchedulerImplSuite", conf)
+    // import org.slf4j.{Logger, LoggerFactory}
+    import org.apache.log4j.{Logger, Level}
+    Logger.getLogger("org.apache.spark.scheduler.TaskSetManager").setLevel(Level.DEBUG)
+    val taskScheduler = new TaskSchedulerImpl(sc,
+      sc.conf.get(config.TASK_MAX_FAILURES),
+      clock = clock) {
+      override def createTaskSetManager(taskSet: TaskSet, maxTaskFailures: Int): TaskSetManager = {
+        new TaskSetManager(this, taskSet, maxTaskFailures, blacklistTrackerOpt, clock)
+      }
+    }
+    // Need to initialize a DAGScheduler for the taskScheduler to use for callbacks.
+    new DAGScheduler(sc, taskScheduler) {
+      override def taskStarted(task: Task[_], taskInfo: TaskInfo): Unit = {}
+
+      override def executorAdded(execId: String, host: String): Unit = {}
+    }
+    taskScheduler.initialize(new FakeSchedulerBackend)
+    val taskSet = FakeTask.createTaskSet(5,
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host1", "exec1")),
+      Seq(TaskLocation("host1", "exec1"))
+    )
+    taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec1", "host1", 1)))
+    taskScheduler.submitTasks(taskSet)
+
+    // First offer host2, exec2: no task should be chosen due to bad data locality
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec2", "host2", 1)))
+      .flatten.isEmpty)
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec1", "host1", 1)))
+      .flatten.head.index === 0)
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec2", "host2", 1)))
+      .flatten.isEmpty)
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec3", "host2", 1)))
+      .flatten.isEmpty)
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec4", "host2", 1)))
+      .flatten.isEmpty)
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec5", "host2", 1)))
+      .flatten.isEmpty)
+    // idle timer shouldn't start for exec 6
+    // there are already as many idle execs as remaining tasks
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec6", "host2", 1)))
+      .flatten.isEmpty)
+
+    clock.advance(LOCALITY_WAIT_MS)
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec6", "host2", 1)))
+      .flatten.isEmpty)
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec1", "host1", 1)))
+      .flatten.head.index === 1)
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec2", "host2", 1)))
+      .flatten.head.index === 2)
+
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec1", "host1", 1)))
+      .flatten.head.index === 3)
+
+    // Shouldn't have tasks because exec2 was just busy and this isn't local
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec2", "host2", 1)))
+      .flatten.isEmpty)
+  }
+
   test("Scheduler does not crash when tasks are not serializable") {
     val taskCpus = 2
     val taskScheduler = setupSchedulerWithMaster(

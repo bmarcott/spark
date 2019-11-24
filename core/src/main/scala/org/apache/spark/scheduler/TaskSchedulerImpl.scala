@@ -36,7 +36,7 @@ import org.apache.spark.rpc.RpcEndpoint
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.TaskLocality.TaskLocality
 import org.apache.spark.storage.BlockManagerId
-import org.apache.spark.util.{AccumulatorV2, SystemClock, ThreadUtils, Utils}
+import org.apache.spark.util.{AccumulatorV2, Clock, SystemClock, ThreadUtils, Utils}
 
 /**
  * Schedules tasks for multiple types of clusters by acting through a SchedulerBackend.
@@ -61,7 +61,8 @@ import org.apache.spark.util.{AccumulatorV2, SystemClock, ThreadUtils, Utils}
 private[spark] class TaskSchedulerImpl(
     val sc: SparkContext,
     val maxTaskFailures: Int,
-    isLocal: Boolean = false)
+    isLocal: Boolean = false,
+    clock: Clock = new SystemClock())
   extends TaskScheduler with Logging {
 
   import TaskSchedulerImpl._
@@ -114,6 +115,7 @@ private[spark] class TaskSchedulerImpl(
 
   // IDs of the tasks running on each executor
   private val executorIdToRunningTaskIds = new HashMap[String, HashSet[Long]]
+  private val executorIdToIdleStartTime = new HashMap[String, Long]
 
   def runningTasksByExecutors: Map[String, Int] = synchronized {
     executorIdToRunningTaskIds.toMap.mapValues(_.size)
@@ -128,7 +130,7 @@ private[spark] class TaskSchedulerImpl(
   protected val executorIdToHost = new HashMap[String, String]
 
   private val abortTimer = new Timer(true)
-  private val clock = new SystemClock
+
   // Exposed for testing
   val unschedulableTaskSetToExpiryTime = new HashMap[TaskSetManager, Long]
 
@@ -342,13 +344,17 @@ private[spark] class TaskSchedulerImpl(
       val host = shuffledOffers(i).host
       if (availableCpus(i) >= CPUS_PER_TASK &&
         resourcesMeetTaskRequirements(availableResources(i))) {
+        val ignoreLocality = executorIdToIdleStartTime.get(execId)
+          .exists(clock.getTimeMillis() - _ >= 3000)
         try {
-          for (task <- taskSet.resourceOffer(execId, host, maxLocality, availableResources(i))) {
+          for (task <- taskSet
+            .resourceOffer(execId, host, maxLocality, availableResources(i), ignoreLocality)) {
             tasks(i) += task
             val tid = task.taskId
             taskIdToTaskSetManager.put(tid, taskSet)
             taskIdToExecutorId(tid) = execId
             executorIdToRunningTaskIds(execId).add(tid)
+            executorIdToIdleStartTime.remove(execId)
             availableCpus(i) -= CPUS_PER_TASK
             assert(availableCpus(i) >= 0)
             task.resources.foreach { case (rName, rInfo) =>
@@ -538,6 +544,26 @@ private[spark] class TaskSchedulerImpl(
         }
       }
     }
+
+    if (sortedTaskSets.nonEmpty) {
+      val remainingTasks = sortedTaskSets.map(tsm => tsm.numTasks - tsm.tasksSuccessful).sum
+      val tasksRunning = taskIdToExecutorId.size
+      val tasksUnscheduled = remainingTasks - tasksRunning
+      val timersToStart = tasksUnscheduled - executorIdToIdleStartTime.size
+      var numIdleBegin = 0
+      if (timersToStart > 0) {
+        shuffledOffers
+          .map(_.executorId)
+          .filter(execId => !isExecutorBusy(execId) && !executorIdToIdleStartTime.contains(execId))
+          .foreach(execId => {
+            if (numIdleBegin < timersToStart) {
+              executorIdToIdleStartTime.getOrElseUpdate(execId, clock.getTimeMillis())
+              numIdleBegin += 1
+            }
+          })
+      }
+    }
+
 
     // TODO SPARK-24823 Cancel a job that contains barrier stage(s) if the barrier tasks don't get
     // launched within a configured time.
@@ -808,6 +834,7 @@ private[spark] class TaskSchedulerImpl(
       // happen below in the rootPool.executorLost() call.
       taskIds.foreach(cleanupTaskState)
     }
+    executorIdToIdleStartTime.remove(executorId)
 
     val host = executorIdToHost(executorId)
     val execs = hostToExecutors.getOrElse(host, new HashSet)
