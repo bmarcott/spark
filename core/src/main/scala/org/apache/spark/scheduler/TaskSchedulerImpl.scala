@@ -345,7 +345,7 @@ private[spark] class TaskSchedulerImpl(
       if (availableCpus(i) >= CPUS_PER_TASK &&
         resourcesMeetTaskRequirements(availableResources(i))) {
         val ignoreLocality = executorIdToIdleStartTime.get(execId)
-          .exists(clock.getTimeMillis() - _ >= 3000)
+          .exists(clock.getTimeMillis() - _ >= 3000) && maxLocality.equals(TaskLocality.ANY)
         try {
           for (task <- taskSet
             .resourceOffer(execId, host, maxLocality, availableResources(i), ignoreLocality)) {
