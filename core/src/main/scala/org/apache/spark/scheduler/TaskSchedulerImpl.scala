@@ -115,7 +115,7 @@ private[spark] class TaskSchedulerImpl(
 
   // IDs of the tasks running on each executor
   private val executorIdToRunningTaskIds = new HashMap[String, HashSet[Long]]
-  private val executorIdToIdleStartTime = new HashMap[String, Long]
+  private val executorIdToIdleStartTime = new HashMap[String, HashMap[TaskSetManager, Long]]
 
   def runningTasksByExecutors: Map[String, Int] = synchronized {
     executorIdToRunningTaskIds.toMap.mapValues(_.size)
@@ -344,17 +344,17 @@ private[spark] class TaskSchedulerImpl(
       val host = shuffledOffers(i).host
       if (availableCpus(i) >= CPUS_PER_TASK &&
         resourcesMeetTaskRequirements(availableResources(i))) {
-        val ignoreLocality = executorIdToIdleStartTime.get(execId)
-          .exists(clock.getTimeMillis() - _ >= 3000) && maxLocality.equals(TaskLocality.ANY)
+        val ignoreDelayedScheduling = executorIdToIdleStartTime.get(execId).flatMap(_.get(taskSet))
+          .exists(clock.getTimeMillis() - _ >= 2000)
         try {
           for (task <- taskSet
-            .resourceOffer(execId, host, maxLocality, availableResources(i), ignoreLocality)) {
+            .resourceOffer(execId, host, maxLocality, availableResources(i), ignoreDelayedScheduling)) {
             tasks(i) += task
             val tid = task.taskId
             taskIdToTaskSetManager.put(tid, taskSet)
             taskIdToExecutorId(tid) = execId
             executorIdToRunningTaskIds(execId).add(tid)
-            executorIdToIdleStartTime.remove(execId)
+            executorIdToIdleStartTime.get(execId).foreach(_.clear())
             availableCpus(i) -= CPUS_PER_TASK
             assert(availableCpus(i) >= 0)
             task.resources.foreach { case (rName, rInfo) =>
@@ -545,24 +545,9 @@ private[spark] class TaskSchedulerImpl(
       }
     }
 
-    if (sortedTaskSets.nonEmpty) {
-      val remainingTasks = sortedTaskSets.map(tsm => tsm.numTasks - tsm.tasksSuccessful).sum
-      val tasksRunning = taskIdToExecutorId.size
-      val tasksUnscheduled = remainingTasks - tasksRunning
-      val timersToStart = tasksUnscheduled - executorIdToIdleStartTime.size
-      var numIdleBegin = 0
-      if (timersToStart > 0) {
-        shuffledOffers
-          .map(_.executorId)
-          .filter(execId => !isExecutorBusy(execId) && !executorIdToIdleStartTime.contains(execId))
-          .foreach(execId => {
-            if (numIdleBegin < timersToStart) {
-              executorIdToIdleStartTime.getOrElseUpdate(execId, clock.getTimeMillis())
-              numIdleBegin += 1
-            }
-          })
-      }
-    }
+    sortedTaskSets.foreach(tsm => {
+      setIdleExecutorTimers(shuffledOffers, tsm)
+    })
 
 
     // TODO SPARK-24823 Cancel a job that contains barrier stage(s) if the barrier tasks don't get
@@ -571,6 +556,29 @@ private[spark] class TaskSchedulerImpl(
       hasLaunchedTask = true
     }
     return tasks
+  }
+
+  private def setIdleExecutorTimers(
+      shuffledOffers: IndexedSeq[WorkerOffer],
+      tsm: TaskSetManager): Unit = {
+    val pendingTasks = tsm.tasks.length - tsm.tasksSuccessful - tsm.runningTasks
+    val timersToStart =
+      pendingTasks - executorIdToIdleStartTime.count(_._2.contains(tsm))
+    var numIdleBegin = 0
+    if (timersToStart > 0) {
+      shuffledOffers
+        .map(_.executorId)
+        .filter(execId => !isExecutorBusy(execId) && !executorIdToIdleStartTime
+          .getOrElseUpdate(execId, new HashMap[TaskSetManager, Long]).contains(tsm))
+        .foreach(execId => {
+          if (numIdleBegin < timersToStart) {
+            val idleMap = executorIdToIdleStartTime
+              .get(execId)
+            idleMap.map(_.getOrElseUpdate(tsm, clock.getTimeMillis()))
+            numIdleBegin += 1
+          }
+        })
+    }
   }
 
   private def createUnschedulableTaskSetAbortTimer(

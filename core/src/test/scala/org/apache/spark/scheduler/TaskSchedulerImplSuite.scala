@@ -196,7 +196,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
   }
 
   test("executors should not sit idle for too long") {
-    val LOCALITY_WAIT_MS = 3000
+    val LOCALITY_WAIT_MS = 2000
     val clock = new ManualClock
     val conf = new SparkConf()
     sc = new SparkContext("local", "TaskSchedulerImplSuite", conf)
@@ -209,6 +209,11 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
       override def createTaskSetManager(taskSet: TaskSet, maxTaskFailures: Int): TaskSetManager = {
         new TaskSetManager(this, taskSet, maxTaskFailures, blacklistTrackerOpt, clock)
       }
+      override def shuffleOffers(offers: IndexedSeq[WorkerOffer]): IndexedSeq[WorkerOffer] = {
+        // Don't shuffle the offers around for this test.  Instead, we'll just pass in all
+        // the permutations we care about directly.
+        offers
+      }
     }
     // Need to initialize a DAGScheduler for the taskScheduler to use for callbacks.
     new DAGScheduler(sc, taskScheduler) {
@@ -217,7 +222,7 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
       override def executorAdded(execId: String, host: String): Unit = {}
     }
     taskScheduler.initialize(new FakeSchedulerBackend)
-    val taskSet = FakeTask.createTaskSet(5,
+    val taskSet = FakeTask.createTaskSet(5, 1, 1,
       Seq(TaskLocation("host1", "exec1")),
       Seq(TaskLocation("host1", "exec1")),
       Seq(TaskLocation("host1", "exec1")),
@@ -259,6 +264,27 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext with B
     // Shouldn't have tasks because exec2 was just busy and this isn't local
     assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec2", "host2", 1)))
       .flatten.isEmpty)
+
+    // exec 5 was idle for too long, should be utilized despite not local
+    // first task set complete after this
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec5", "host2", 1)))
+      .flatten.head.index === 4)
+
+    // Test that new tasks don't pick up previously idle exectors
+    val taskSet2 = FakeTask.createTaskSet(1, 2, 2,
+      Seq(TaskLocation("host3", "exec1")),
+    )
+    taskScheduler.submitTasks(taskSet2)
+
+    // Data is not local, and this is new taskset, so should delay (nothing scheduled)
+    assert(taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec3", "host2", 1)))
+      .flatten.isEmpty)
+
+    clock.advance(LOCALITY_WAIT_MS)
+    // Despite exec3 timing out, exec1 should be scheduled because it is local
+    val taskDescriptions = taskScheduler.resourceOffers(IndexedSeq(WorkerOffer("exec3", "host2", 1), WorkerOffer("exec1", "host3", 1)))
+    assert(taskDescriptions.flatten.size === 1 && taskDescriptions.flatten.head.executorId.equals("exec1"))
+
   }
 
   test("Scheduler does not crash when tasks are not serializable") {

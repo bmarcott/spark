@@ -380,7 +380,7 @@ private[spark] class TaskSetManager(
       host: String,
       maxLocality: TaskLocality.TaskLocality,
       availableResources: Map[String, Seq[String]] = Map.empty,
-      ignoreLocality: Boolean = false)
+      ignoreDelayScheduling: Boolean = false)
     : Option[TaskDescription] =
   {
     val offerBlacklisted = taskSetBlacklistHelperOpt.exists { blacklist =>
@@ -392,7 +392,7 @@ private[spark] class TaskSetManager(
 
       var allowedLocality = maxLocality
 
-      if (maxLocality != TaskLocality.NO_PREF && !ignoreLocality) {
+      if (maxLocality != TaskLocality.NO_PREF && !ignoreDelayScheduling) {
         allowedLocality = getAllowedLocalityLevel(curTime)
         if (allowedLocality > maxLocality) {
           // We're not allowed to search for farther-away tasks
